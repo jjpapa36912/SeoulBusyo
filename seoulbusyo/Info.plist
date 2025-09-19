@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>NSAppTransportSecurity</key>
+    <dict>
+      <key>NSAllowsArbitraryLoads</key>
+      <true/>
+      <key>NSExceptionDomains</key>
+      <dict>
+        <key>ws.bus.go.kr</key>
+        <dict>
+          <key>NSIncludesSubdomains</key>
+          <true/>
+          <key>NSExceptionAllowsInsecureHTTPLoads</key>
+          <true/>
+        </dict>
+      </dict>
+    </dict>
+
+
+  <!-- 위치 권한 문구 -->
+  <key>NSLocationWhenInUseUsageDescription</key>
+  <string>내 주변 정류장과 버스 위치를 보여주기 위해 위치 접근이 필요합니다.</string>
+  <key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
+  <string>앱 사용 중에도 주변 정류장을 빠르게 찾기 위해 위치 접근을 허용해 주세요.</string>
+
+  <!-- (나머지 기존 키들은 그대로 두세요. CFBundleName 등 기본 키는 삭제하면 안 됩니다) -->
+
+</dict>
+</plist>

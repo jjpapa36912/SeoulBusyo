@@ -146,10 +146,12 @@ private extension URLResponse {
 // MARK: - API
 final class BusAPI: NSObject, URLSessionDelegate {
 //    private let serviceKeyRaw = "FVUZJTrP1WLAsFAKcXy8lh2Qy1DWNw5Ul2+vSY01E3cUJlO/9P+CodODXPIyzppQCPswXvc1WeblEAh6X41ClA=="
-        private let serviceKeyRaw = "FVUZJTrP1WLAsFAKcXy8lh2Qy1DWNw5Ul2%2BvSY01E3cUJlO%2F9P%2BCodODXPIyzppQCPswXvc1WeblEAh6X41ClA%3D%3D"
+        private let serviceKeyRaw = "FVUZJTrP1WLAsFAKcXy8lh2Qy1DWNw5Ul2+vSY01E3cUJlO/9P+CodODXPIyzppQCPswXvc1WeblEAh6X41ClA=="
     // ✅ 서울시 전용 인증키를 여기 넣어주세요(서울열린데이터광장에서 발급받은 키)
+//    private var seoulServiceKeyRaw: String = "FVUZJTrP1WLAsFAKcXy8lh2Qy1DWNw5Ul2%2BvSY01E3cUJlO%2F9P%2BCodODXPIyzppQCPswXvc1WeblEAh6X41ClA%3D%3D"
+
     private var seoulServiceKeyRaw: String = "FVUZJTrP1WLAsFAKcXy8lh2Qy1DWNw5Ul2%2BvSY01E3cUJlO%2F9P%2BCodODXPIyzppQCPswXvc1WeblEAh6X41ClA%3D%3D"
-    
+
     // 키 미노출 프리뷰(앞 4 + 끝 3만 보여줌)
     private func maskKeyPreview(_ key: String) -> String {
         guard key.count > 7 else { return String(repeating: "•", count: key.count) }
@@ -429,8 +431,7 @@ final class BusAPI: NSObject, URLSessionDelegate {
             return (cd, msg, cnt)
         }
 
-        // ✅ itemList가 [Dict] / Dict / null / "" 모두 올 수 있고,
-        //    루트가 ServiceResult 없이 바로 오는 케이스를 지원
+        // ★ 핵심: itemList → arsId 로 BusStop.id 세팅 (stationId/stId 아님!)
         @inline(__always)
         func parseStopsJSON(_ data: Data, tag: String) -> [BusStop] {
             let anyRoot = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
@@ -456,8 +457,7 @@ final class BusAPI: NSObject, URLSessionDelegate {
                 return []
             }
 
-            let listAny = body?["itemList"]
-            let list = normalizeList(listAny)
+            let list = normalizeList(body?["itemList"])
 
             let header = container["msgHeader"] as? [String: Any]
             let hdrCnt = header?["itemCount"] ?? "nil"
@@ -476,17 +476,31 @@ final class BusAPI: NSObject, URLSessionDelegate {
                 return nil
             }
 
+            // ✅ BusStop.id = arsId, name = stationNm, 좌표는 gpsX/gpsY 우선
+            // 기존:
+            // let out: [BusStop] = list.compactMap { it in
+            //     guard let id   = dstr(it, "stationId"), ...
+
+            // 교체:
+            // (교체) out 생성부 – arsId 우선 사용
             let out: [BusStop] = list.compactMap { it in
+                // ✅ arsId(서울 ETA용) 우선 → 없을 때만 stationId 사용
+                let chosenId = dstr(it, "arsId") ?? dstr(it, "stationId")
+
                 guard
-                    let id   = dstr(it, "stationId"), !id.isEmpty,
+                    let id   = chosenId, !id.isEmpty,
                     let name = dstr(it, "stationNm"), !name.isEmpty
                 else { return nil }
+
                 // 좌표는 gpsX/gpsY 우선, 없으면 posX/posY도 시도
                 let lonVal = ddouble(it, "gpsX") ?? ddouble(it, "posX")
                 let latVal = ddouble(it, "gpsY") ?? ddouble(it, "posY")
                 guard let lon = lonVal, let lat = latVal else { return nil }
+
                 return BusStop(id: id, name: name, lat: lat, lon: lon, cityCode: 0)
             }
+
+
 
             print("✅ [\(tag)] parsedStops=\(out.count)")
             return out
@@ -515,7 +529,7 @@ final class BusAPI: NSObject, URLSessionDelegate {
 
         let base = "http://ws.bus.go.kr/api/rest/stationinfo/getStationByPos"
 
-        // ── 1차: tmX/tmY (curl과 동일하게 사용) ────────────────────────────────
+        // 1) TM 파라미터 사용 버전 (지금 버전 유지)
         let url1 = "\(base)?serviceKey=\(seoulServiceKeyRaw)&tmX=\(lon)&tmY=\(lat)&radius=800&resultType=json"
         do {
             let data = try await doGET(url1, name: "Stops(Seoul:Pos:TM:800)")
@@ -529,20 +543,24 @@ final class BusAPI: NSObject, URLSessionDelegate {
             print("⚠️ TM:800 요청 실패: \(error.localizedDescription) — posX/posY 폴백")
         }
 
-        // ── 2차: posX/posY (WGS84) ──────────────────────────────────────────────
+        // 2) WGS84 파라미터 폴백
         let url2 = "\(base)?serviceKey=\(seoulServiceKeyRaw)&posX=\(lon)&posY=\(lat)&radius=800&resultType=json"
         do {
             let data = try await doGET(url2, name: "Stops(Seoul:Pos:WGS84:800)")
             let hdr = parseHeader(data)
             print("🧾 Stops(Seoul:Pos:WGS84:800) headerCd=\(hdr.cd ?? "?") msg=\(hdr.msg ?? "?") itemCount=\(hdr.cnt ?? -1)")
             let stops = parseStopsJSON(data, tag: "Stops(Seoul:Pos:WGS84:800)")
+            // ✅ 여기서 이렇게 찍으세요 (out 말고 stops!)
+            if let first = stops.first {
+                print("🛑 first stop arsId(id)=\(first.id) name=\(first.name) lat=\(first.lat) lon=\(first.lon)")
+            }
             Telemetry.shared.mark(.fetchStopsEnd, tags:["src":"Seoul:WGS84:800"], fields:["count": Double(stops.count)])
             if !stops.isEmpty { return stops }
             print("⚠️ WGS84:800 결과 0건")
         } catch {
             print("⚠️ WGS84:800 요청 실패: \(error.localizedDescription)")
         }
-
+        
         Telemetry.shared.mark(.fetchStopsEnd, tags:[:], fields:[:])
         return []
     }
@@ -554,87 +572,144 @@ final class BusAPI: NSObject, URLSessionDelegate {
 
     // 2) 정류장 ETA
     // BusAPI 내부
-    // 서울시: 특정 정류장(arsId) 도착정보
-    // 기존 시그니처 유지: cityCode는 무시
+    // 기존 시그니처 유지
+    // 기존 시그니처 유지
+    // 기존 시그니처 유지
     func fetchArrivalsDetailed(cityCode: Int, nodeId: String) async throws -> [ArrivalInfo] {
         Telemetry.shared.mark(.fetchArrivalsBegin, tags: ["fn":"fetchArrivalsDetailed(Seoul)"])
 
-        guard var comps = URLComponents(string: "http://ws.bus.go.kr/api/rest/stationinfo/getStationByUid") else {
-            throw APIError.invalidURL
+        let base = "http://ws.bus.go.kr/api/rest/stationinfo/getStationByUid"
+        let url1 = "\(base)?serviceKey=\(seoulServiceKeyRaw)&arsId=\(nodeId)&resultType=json"
+        @inline(__always)
+        func doGET(_ urlString: String, name: String) async throws -> Data {
+            guard let url = URL(string: urlString) else { throw APIError.invalidURL }
+            Telemetry.shared.mark(.fetchArrivalsBegin, tags: ["name": name])
+            let t0 = Date()
+            do {
+                let (data, resp) = try await URLSession.shared.data(from: url)
+                let ms = Date().timeIntervalSince(t0) * 1000
+                Telemetry.shared.mark(.fetchArrivalsEnd,
+                                      tags: ["name": name, "code": "\( (resp as? HTTPURLResponse)?.statusCode ?? -1)"],
+                                      fields: ["ms": ms])
+                print("🌐 \(name) → \(url.absoluteString)")
+                print("🔎 \(name) peek=\(peek(data))")
+                return data
+            } catch {
+                let ms = Date().timeIntervalSince(t0) * 1000
+                Telemetry.shared.mark(.error, tags:["where":"fetchStops", "name":name], fields:["ms": ms])
+                throw error
+            }
         }
-        comps.queryItems = [
-            .init(name: "serviceKey", value: serviceKeyRaw.encodedForServiceKey),
-            .init(name: "arsId", value: nodeId)
-        ]
-        guard let url = comps.url else { throw APIError.invalidURL }
+        // GET 요청
+        let data = try await doGET(url1, name: "Arrivals(Seoul:ByUid)")
+        print("🔎 Arrivals JSON peek=\(peek(data))")
 
-        let (data, _) = try await send("Arrivals(Seoul:ByUid)", url: url)
-        let arr = try parseXMLItems(data)
+        // JSON 파싱
+        let anyRoot = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        let root = anyRoot ?? [:]
+        let body = (root["msgBody"] as? [String: Any]) ?? [:]
+        let itemsAny = body["itemList"]
 
-        // 흔한 필드:
-        // rtId(노선ID), rtNm(노선번호), arrmsg1/2(문자), traTime1/2(초), adirection(방향/종점)
+        func normalizeList(_ any: Any?) -> [[String: Any]] {
+            if let arr = any as? [[String: Any]] { return arr }
+            if let dict = any as? [String: Any] { return [dict] }
+            return []
+        }
+        let list = normalizeList(itemsAny)
+
         var out: [ArrivalInfo] = []
-        for d in arr {
-            guard let rid = d["rtid"] ?? d["rtId"],
-                  let rno = d["rtnm"] ?? d["rtNm"]
-            else { continue }
-
-            let sec1 = toInt(d["tratime1"]) ?? toInt(d["traTime1"]) ?? toInt(d["traTime"])
-            let sec2 = toInt(d["tratime2"]) ?? toInt(d["traTime2"])
-            let dest = d["adirection"] ?? d["direction"] ?? d["dest"] ?? d["stEnd"]
-
-            if let s1 = sec1 {
+        for it in list {
+            let rid = it["busRouteId"] as? String ?? ""
+            let rno = it["rtNm"] as? String ?? ""
+            let dest = it["adirection"] as? String ?? ""
+            if let s1 = (it["traTime1"] as? String).flatMap(Int.init) {
                 out.append(.init(routeId: rid, routeNo: rno, etaMinutes: max(0, s1/60), destination: dest))
             }
-            if let s2 = sec2 {
+            if let s2 = (it["traTime2"] as? String).flatMap(Int.init) {
                 out.append(.init(routeId: rid, routeNo: rno, etaMinutes: max(0, s2/60), destination: dest))
             }
         }
 
-        // ETA 오름차순
         out.sort { $0.etaMinutes < $1.etaMinutes }
-        Telemetry.shared.mark(.fetchArrivalsEnd, tags:["src":"Seoul"], fields:["count": Double(out.count)])
+        Telemetry.shared.mark(.fetchArrivalsEnd, tags:["src":"Seoul","arsId":nodeId,"fmt":"json"], fields:["count":Double(out.count)])
         return out
     }
+
+
 
 
     // BusAPI 내부
     // 서울시: 노선별 버스 실시간 위치
     // 기존 시그니처 유지: cityCode 무시
+    // 기존 시그니처 유지: cityCode 무시
+    // MARK: - 노선 매핑 테이블
+    /// routeId → routeNo
+    var routeNoByRouteId: [String: String] = [:]
+
+    /// routeNo → routeId
+    var routeIdByRouteNo: [String: String] = [:]
+
+    /// routeNo → 숫자 routeId (String)
+    var numericRouteIdByRouteNo: [String: String] = [:]
+
+    // 기존 시그니처 유지
+    // 기존 시그니처 유지
     func fetchBusLocations(cityCode: Int, routeId: String) async throws -> [BusLive] {
         Telemetry.shared.mark(.fetchBusLocBegin, tags: ["fn":"fetchBusLocations(Seoul)"])
 
-        guard var comps = URLComponents(string: "http://ws.bus.go.kr/api/rest/buspos/getBusPosByRtid") else {
-            throw APIError.invalidURL
+        let base = "http://ws.bus.go.kr/api/rest/buspos/getBusPosByRtid"
+        let url1 = "\(base)?serviceKey=\(seoulServiceKeyRaw)&busRouteId=\(routeId)&resultType=json"
+        @inline(__always)
+        func doGET(_ urlString: String, name: String) async throws -> Data {
+            guard let url = URL(string: urlString) else { throw APIError.invalidURL }
+            Telemetry.shared.mark(.fetchArrivalsBegin, tags: ["name": name])
+            let t0 = Date()
+            do {
+                let (data, resp) = try await URLSession.shared.data(from: url)
+                let ms = Date().timeIntervalSince(t0) * 1000
+                Telemetry.shared.mark(.fetchArrivalsEnd,
+                                      tags: ["name": name, "code": "\( (resp as? HTTPURLResponse)?.statusCode ?? -1)"],
+                                      fields: ["ms": ms])
+                print("🌐 \(name) → \(url.absoluteString)")
+                print("🔎 \(name) peek=\(peek(data))")
+                return data
+            } catch {
+                let ms = Date().timeIntervalSince(t0) * 1000
+                Telemetry.shared.mark(.error, tags:["where":"fetchStops", "name":name], fields:["ms": ms])
+                throw error
+            }
         }
-        comps.queryItems = [
-            .init(name: "serviceKey", value: serviceKeyRaw.encodedForServiceKey),
-            .init(name: "busRouteId", value: routeId)
-        ]
-        guard let url = comps.url else { throw APIError.invalidURL }
+        // GET 요청
+        let data = try await doGET(url1, name: "BusLoc(Seoul:ByRtid)")
+        print("🔎 BusLoc JSON peek=\(peek(data))")
 
-        let (data, _) = try await send("BusLoc(Seoul:ByRtid)", url: url)
-        let arr = try parseXMLItems(data)
+        // JSON 파싱
+        let anyRoot = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        let root = anyRoot ?? [:]
+        let body = (root["msgBody"] as? [String: Any]) ?? [:]
+        let itemsAny = body["itemList"]
 
-        // 대표 필드: vehId/plainNo(차량), rtNm/rtId(노선), gpsX/gpsY, nextStn/stationNm 등
-        let out: [BusLive] = arr.compactMap { d in
-            // id
-            let veh = d["vehid"] ?? d["vehId"] ?? d["plainno"] ?? d["plainNo"]
-            // route no
-            let rno = d["rtnm"] ?? d["rtNm"] ?? d["routenm"] ?? d["routeNm"] ?? "?"
-            // coord
-            let la = toDouble(d["gpsy"]) ?? toDouble(d["gpsy"]) ?? toDouble(d["wgs84Lat"])
-            let lo = toDouble(d["gpsx"]) ?? toDouble(d["gpsx"]) ?? toDouble(d["wgs84Lon"])
-            // next stop name
-            let nextName = d["stationnm"] ?? d["stationNm"] ?? d["nodenm"] ?? d["nodeNm"]
+        func normalizeList(_ any: Any?) -> [[String: Any]] {
+            if let arr = any as? [[String: Any]] { return arr }
+            if let dict = any as? [String: Any] { return [dict] }
+            return []
+        }
+        let list = normalizeList(itemsAny)
 
+        let out: [BusLive] = list.compactMap { it in
+            let veh = it["vehId"] as? String ?? it["plainNo"] as? String
+            let rno = it["rtNm"] as? String ?? "?"
+            let la  = (it["gpsY"] as? String).flatMap(Double.init)
+            let lo  = (it["gpsX"] as? String).flatMap(Double.init)
+            let nextName = it["stationNm"] as? String ?? it["nxtStn"] as? String
             guard let veh, let la, let lo else { return nil }
             return BusLive(id: veh, routeNo: rno, lat: la, lon: lo, etaMinutes: nil, nextStopName: nextName)
         }
 
-        Telemetry.shared.mark(.fetchBusLocEnd, tags:["src":"Seoul"], fields:["count": Double(out.count)])
+        Telemetry.shared.mark(.fetchBusLocEnd, tags:["src":"Seoul","fmt":"json"], fields:["count": Double(out.count)])
         return out
     }
+
 
 
     

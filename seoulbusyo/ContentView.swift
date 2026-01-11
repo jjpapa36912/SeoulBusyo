@@ -82,7 +82,7 @@ fileprivate func maskKey(_ k: String) -> String { k.count > 12 ? "\(k.prefix(6))
 struct BusStop: Identifiable, Hashable { let id: String, name: String, lat: Double, lon: Double, cityCode: Int }
 struct BusLive: Identifiable, Hashable {
     let id: String
-    let routeNo: String
+    var routeNo: String
     var lat: Double
     var lon: Double
     var etaMinutes: Int?
@@ -575,65 +575,108 @@ final class BusAPI: NSObject, URLSessionDelegate {
     // 기존 시그니처 유지
     // 기존 시그니처 유지
     // 기존 시그니처 유지
+    // 기존 시그니처 유지
     func fetchArrivalsDetailed(cityCode: Int, nodeId: String) async throws -> [ArrivalInfo] {
         Telemetry.shared.mark(.fetchArrivalsBegin, tags: ["fn":"fetchArrivalsDetailed(Seoul)"])
 
-        let base = "http://ws.bus.go.kr/api/rest/stationinfo/getStationByUid"
-        let url1 = "\(base)?serviceKey=\(seoulServiceKeyRaw)&arsId=\(nodeId)&resultType=json"
+        // 공용 doGET/peek 유틸이 없다면, 아래 두 개를 이 메서드 맨 위에 로컬함수로 넣어도 OK
+        @inline(__always)
+        func peek(_ data: Data, limit: Int = 260) -> String {
+            let s = String(data: data, encoding: .utf8) ?? "<non-utf8 \(data.count)b>"
+            return String(s.prefix(limit)).replacingOccurrences(of: "\n", with: " ")
+        }
         @inline(__always)
         func doGET(_ urlString: String, name: String) async throws -> Data {
             guard let url = URL(string: urlString) else { throw APIError.invalidURL }
             Telemetry.shared.mark(.fetchArrivalsBegin, tags: ["name": name])
             let t0 = Date()
-            do {
-                let (data, resp) = try await URLSession.shared.data(from: url)
-                let ms = Date().timeIntervalSince(t0) * 1000
-                Telemetry.shared.mark(.fetchArrivalsEnd,
-                                      tags: ["name": name, "code": "\( (resp as? HTTPURLResponse)?.statusCode ?? -1)"],
-                                      fields: ["ms": ms])
-                print("🌐 \(name) → \(url.absoluteString)")
-                print("🔎 \(name) peek=\(peek(data))")
-                return data
-            } catch {
-                let ms = Date().timeIntervalSince(t0) * 1000
-                Telemetry.shared.mark(.error, tags:["where":"fetchStops", "name":name], fields:["ms": ms])
-                throw error
-            }
+            let (data, resp) = try await URLSession.shared.data(from: url)
+            let ms = Date().timeIntervalSince(t0) * 1000
+            Telemetry.shared.mark(.fetchArrivalsEnd,
+                                  tags: ["name": name, "code": "\((resp as? HTTPURLResponse)?.statusCode ?? -1)"],
+                                  fields: ["ms": ms])
+            print("🌐 \(name) → \(url.absoluteString)")
+            print("🔎 \(name) peek=\(peek(data))")
+            return data
         }
-        // GET 요청
-        let data = try await doGET(url1, name: "Arrivals(Seoul:ByUid)")
-        print("🔎 Arrivals JSON peek=\(peek(data))")
 
-        // JSON 파싱
-        let anyRoot = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
-        let root = anyRoot ?? [:]
-        let body = (root["msgBody"] as? [String: Any]) ?? [:]
-        let itemsAny = body["itemList"]
+        // ✅ 반드시 JSON으로
+        let base = "http://ws.bus.go.kr/api/rest/stationinfo/getStationByUid"
+        let url = "\(base)?serviceKey=\(seoulServiceKeyRaw)&arsId=\(nodeId)&resultType=json"
+
+        let data = try await doGET(url, name: "Arrivals(Seoul:ByUid)")
+
+        // ── JSON 파싱: ServiceResult 감싸기/단일/배열/빈값 모두 대응 ──
+        let anyRoot = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
+        let container = (anyRoot["ServiceResult"] as? [String: Any]) ?? anyRoot
+        let header = container["msgHeader"] as? [String: Any]
+        let body = container["msgBody"] as? [String: Any]
 
         func normalizeList(_ any: Any?) -> [[String: Any]] {
             if let arr = any as? [[String: Any]] { return arr }
             if let dict = any as? [String: Any] { return [dict] }
+            if any is NSNull { return [] }
+            if let s = any as? String, s.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return [] }
             return []
         }
-        let list = normalizeList(itemsAny)
 
+        let list = normalizeList(body?["itemList"])
+        let code = (header?["headerCd"] as? String) ?? ""
+        let msg  = (header?["headerMsg"] as? String) ?? ""
+        print("🧾 headerCd=\(code) headerMsg=\(msg) listCount=\(list.count)")
+
+        // d[key] → String?
+        func dstr(_ d: [String: Any], _ k: String) -> String? {
+            if let v = d[k] as? String { return v }
+            if let v = d[k] as? NSNumber { return v.stringValue }
+            return nil
+        }
+        // d[key] → Int?
+        func dint(_ d: [String: Any], _ k: String) -> Int? {
+            if let s = d[k] as? String, let x = Int(s) { return x }
+            if let n = d[k] as? NSNumber { return n.intValue }
+            return nil
+        }
+
+        // ✅ 핵심: **실제로 오는 차만** 추가
         var out: [ArrivalInfo] = []
         for it in list {
-            let rid = it["busRouteId"] as? String ?? ""
-            let rno = it["rtNm"] as? String ?? ""
-            let dest = it["adirection"] as? String ?? ""
-            if let s1 = (it["traTime1"] as? String).flatMap(Int.init) {
-                out.append(.init(routeId: rid, routeNo: rno, etaMinutes: max(0, s1/60), destination: dest))
+            guard let rid = dstr(it, "busRouteId"),
+                  let rno = dstr(it, "rtNm") else { continue }
+
+            // 우선순위: traTime1/2(초) > arrmsg(문자) 교차 사용
+            let sec1 = dint(it, "traTime1")
+            let sec2 = dint(it, "traTime2")
+            let msg1 = dstr(it, "arrmsg1")?.trimmingCharacters(in: .whitespaces) ?? ""
+            let msg2 = dstr(it, "arrmsg2")?.trimmingCharacters(in: .whitespaces) ?? ""
+            let dest = dstr(it, "adirection") ?? dstr(it, "stEnd") ?? dstr(it, "direction")
+
+            // “운행종료/출발대기/곧도착” 등의 텍스트가 들어오므로 보정
+            func etaMinFrom(sec: Int?, msg: String) -> Int? {
+                if let s = sec, s > 0 { return max(0, s/60) }
+                // 보조: “곧 도착”류 메시지 → 1~2분 가정 (필요시 조정)
+                if msg.contains("곧") || msg.contains("잠시후") { return 1 }
+                // 운행종료/출발대기/대기 등은 스킵
+                if msg.contains("운행종료") || msg.contains("출발대기") { return nil }
+                return nil
             }
-            if let s2 = (it["traTime2"] as? String).flatMap(Int.init) {
-                out.append(.init(routeId: rid, routeNo: rno, etaMinutes: max(0, s2/60), destination: dest))
+
+            if let m1 = etaMinFrom(sec: sec1, msg: msg1) {
+                out.append(.init(routeId: rid, routeNo: rno, etaMinutes: m1, destination: dest))
+            }
+            if let m2 = etaMinFrom(sec: sec2, msg: msg2) {
+                out.append(.init(routeId: rid, routeNo: rno, etaMinutes: m2, destination: dest))
             }
         }
 
+        // ETA 오름차순
         out.sort { $0.etaMinutes < $1.etaMinutes }
-        Telemetry.shared.mark(.fetchArrivalsEnd, tags:["src":"Seoul","arsId":nodeId,"fmt":"json"], fields:["count":Double(out.count)])
+        Telemetry.shared.mark(.fetchArrivalsEnd,
+                              tags:["src":"Seoul", "arsId": nodeId, "fmt":"json", "code": code],
+                              fields:["count": Double(out.count)])
         return out
     }
+
 
 
 
@@ -654,61 +697,148 @@ final class BusAPI: NSObject, URLSessionDelegate {
 
     // 기존 시그니처 유지
     // 기존 시그니처 유지
+    // 기존 시그니처 유지
+    // ✅ 기존 시그니처 유지
+    // 👇 클래스/구조체 맴버로 하나 추가
+//    private var routeNoByRouteId: [String:String] = [:]
+
+    // =======================
+    // 서울 버스 위치 조회(JSON)
+    // =======================
     func fetchBusLocations(cityCode: Int, routeId: String) async throws -> [BusLive] {
         Telemetry.shared.mark(.fetchBusLocBegin, tags: ["fn":"fetchBusLocations(Seoul)"])
 
-        let base = "http://ws.bus.go.kr/api/rest/buspos/getBusPosByRtid"
-        let url1 = "\(base)?serviceKey=\(seoulServiceKeyRaw)&busRouteId=\(routeId)&resultType=json"
+        // --- 작은 유틸들 ---
+        @inline(__always)
+        func peek(_ data: Data, limit: Int = 260) -> String {
+            let s = String(data: data, encoding: .utf8) ?? "<non-utf8 \(data.count)b>"
+            return String(s.prefix(limit)).replacingOccurrences(of: "\n", with: " ")
+        }
         @inline(__always)
         func doGET(_ urlString: String, name: String) async throws -> Data {
             guard let url = URL(string: urlString) else { throw APIError.invalidURL }
             Telemetry.shared.mark(.fetchArrivalsBegin, tags: ["name": name])
             let t0 = Date()
-            do {
-                let (data, resp) = try await URLSession.shared.data(from: url)
-                let ms = Date().timeIntervalSince(t0) * 1000
-                Telemetry.shared.mark(.fetchArrivalsEnd,
-                                      tags: ["name": name, "code": "\( (resp as? HTTPURLResponse)?.statusCode ?? -1)"],
-                                      fields: ["ms": ms])
-                print("🌐 \(name) → \(url.absoluteString)")
-                print("🔎 \(name) peek=\(peek(data))")
-                return data
-            } catch {
-                let ms = Date().timeIntervalSince(t0) * 1000
-                Telemetry.shared.mark(.error, tags:["where":"fetchStops", "name":name], fields:["ms": ms])
-                throw error
-            }
+            let (data, resp) = try await URLSession.shared.data(from: url)
+            let ms = Date().timeIntervalSince(t0) * 1000
+            Telemetry.shared.mark(.fetchArrivalsEnd,
+                                  tags: ["name": name, "code": "\((resp as? HTTPURLResponse)?.statusCode ?? -1)"],
+                                  fields: ["ms": ms])
+            print("🌐 \(name) → \(url.absoluteString)")
+            print("🔎 \(name) peek=\(peek(data))")
+            return data
         }
-        // GET 요청
-        let data = try await doGET(url1, name: "BusLoc(Seoul:ByRtid)")
-        print("🔎 BusLoc JSON peek=\(peek(data))")
-
-        // JSON 파싱
-        let anyRoot = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
-        let root = anyRoot ?? [:]
-        let body = (root["msgBody"] as? [String: Any]) ?? [:]
-        let itemsAny = body["itemList"]
-
+        @inline(__always)
+        func dstr(_ d: [String: Any], _ k: String) -> String? {
+            if let v = d[k] as? String { return v }
+            if let v = d[k] as? NSNumber { return v.stringValue }
+            return nil
+        }
+        @inline(__always)
+        func ddouble(_ d: [String: Any], _ k: String) -> Double? {
+            if let s = d[k] as? String, let x = Double(s) { return x }
+            if let n = d[k] as? NSNumber { return n.doubleValue }
+            return nil
+        }
         func normalizeList(_ any: Any?) -> [[String: Any]] {
             if let arr = any as? [[String: Any]] { return arr }
             if let dict = any as? [String: Any] { return [dict] }
             return []
         }
-        let list = normalizeList(itemsAny)
 
-        let out: [BusLive] = list.compactMap { it in
-            let veh = it["vehId"] as? String ?? it["plainNo"] as? String
-            let rno = it["rtNm"] as? String ?? "?"
-            let la  = (it["gpsY"] as? String).flatMap(Double.init)
-            let lo  = (it["gpsX"] as? String).flatMap(Double.init)
-            let nextName = it["stationNm"] as? String ?? it["nxtStn"] as? String
-            guard let veh, let la, let lo else { return nil }
-            return BusLive(id: veh, routeNo: rno, lat: la, lon: lo, etaMinutes: nil, nextStopName: nextName)
+        // 0) 노선번호 캐시 확보: 한 번도 못 본 routeId라면 routeAll로 rtNm 받아서 캐시에 저장
+        var commonRouteNo: String? = routeNoByRouteId[routeId]
+        if commonRouteNo == nil {
+            let baseR = "http://ws.bus.go.kr/api/rest/arrive/getArrInfoByRouteAll"
+            let urlR  = "\(baseR)?serviceKey=\(seoulServiceKeyRaw)&busRouteId=\(routeId)&resultType=json"
+            do {
+                let dataR = try await doGET(urlR, name: "RouteAll(Seoul:\(routeId))")
+                let rootR = (try? JSONSerialization.jsonObject(with: dataR)) as? [String: Any] ?? [:]
+                let contR = (rootR["ServiceResult"] as? [String: Any]) ?? rootR
+                let bodyR = contR["msgBody"] as? [String: Any]
+                let listR = normalizeList(bodyR?["itemList"])
+                // rtNm 첫 번째라도 있으면 채택
+                if let first = listR.first, let nm = dstr(first, "rtNm"), !nm.isEmpty {
+                    commonRouteNo = nm
+                    routeNoByRouteId[routeId] = nm
+                }
+            } catch {
+                // 실패해도 진행 (버스 위치엔 영향 없음)
+                print("⚠️ RouteAll fetch failed for \(routeId): \(error.localizedDescription)")
+            }
         }
 
-        Telemetry.shared.mark(.fetchBusLocEnd, tags:["src":"Seoul","fmt":"json"], fields:["count": Double(out.count)])
+        // 1) 버스 위치 호출(JSON 강제)
+        let base = "http://ws.bus.go.kr/api/rest/buspos/getBusPosByRtid"
+        let url  = "\(base)?serviceKey=\(seoulServiceKeyRaw)&busRouteId=\(routeId)&resultType=json"
+        let data = try await doGET(url, name: "BusLoc(Seoul:ByRtid)")
+
+        // 2) 파싱
+        let anyRoot = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
+        let container = (anyRoot["ServiceResult"] as? [String: Any]) ?? anyRoot
+        let header = container["msgHeader"] as? [String: Any]
+        let body   = container["msgBody"] as? [String: Any]
+        let code   = (header?["headerCd"] as? String) ?? ""
+        let msg    = (header?["headerMsg"] as? String) ?? ""
+        let list   = normalizeList(body?["itemList"])
+        print("🧾 BusLoc headerCd=\(code) headerMsg=\(msg) listCount=\(list.count) routeId=\(routeId)")
+
+        var out: [BusLive] = []
+        var skippedNoCoord = 0
+
+        for it in list {
+            // 2-1) 차량 ID
+            let veh = dstr(it, "vehId") ?? dstr(it, "plainNo") ?? dstr(it, "vehid") ?? dstr(it, "plainno")
+
+            // 2-2) 노선번호: 아이템의 rtNm → 캐시 → routeId(최후의 보루)
+            var routeNo: String? = nil
+            if routeNo == nil, let v = dstr(it, "rtNm"), !v.isEmpty { routeNo = v }
+            if routeNo == nil, let v = dstr(it, "rtnm"), !v.isEmpty { routeNo = v }
+            if routeNo == nil { routeNo = commonRouteNo }
+            if routeNo == nil { routeNo = routeNoByRouteId[routeId] }
+            if routeNo == nil { routeNo = routeId } // (보이는 ? 방지용 최후 fallback)
+
+            // 2-3) 좌표(WGS84)
+            let lon = ddouble(it, "gpsX") ?? ddouble(it, "wgs84Lon")
+            let lat = ddouble(it, "gpsY") ?? ddouble(it, "wgs84Lat")
+
+            // 2-4) 다음 정류장명
+            let nextName = dstr(it, "stationNm") ?? dstr(it, "nodeNm") ?? dstr(it, "nextStn") ?? dstr(it, "nxtStn")
+
+            guard let veh, let lat, let lon else { skippedNoCoord += 1; continue }
+            if !( (34.0...39.5).contains(lat) && (125.0...130.0).contains(lon) ) {
+                skippedNoCoord += 1
+                print("⚠️ skip invalid WGS84 lat/lon veh=\(veh) lat=\(lat) lon=\(lon)")
+                continue
+            }
+
+            out.append(BusLive(id: veh,
+                               routeNo: routeNo ?? routeId,
+                               lat: lat, lon: lon,
+                               etaMinutes: nil,
+                               nextStopName: nextName))
+        }
+
+        // 3) 최종 로그 + 텔레메트리
+        if let nm = commonRouteNo { routeNoByRouteId[routeId] = nm } // 보강
+        Telemetry.shared.mark(.fetchBusLocEnd,
+                              tags:["src":"Seoul", "code":code, "routeId": routeId, "routeNo": routeNoByRouteId[routeId] ?? (commonRouteNo ?? "-")],
+                              fields:["count": Double(out.count), "skippedNoCoord": Double(skippedNoCoord)])
+        if let first = out.first {
+            print("🧭 firstBus veh=\(first.id) rno=\(first.routeNo) lat=\(first.lat) lon=\(first.lon) next=\(first.nextStopName ?? "-")")
+        }
         return out
     }
+
+    
+    
+    
+    
+    
+    
+    
+
+
 
 
 
@@ -1031,6 +1161,13 @@ final class MapVM: ObservableObject {
     // ADD: routeNo -> routeId thin wrapper
     func routeId(forRouteNo routeNo: String) -> String? {
         return resolveRouteId(for: routeNo)
+    }
+    // MapVM 내부 아무 곳(기존 코드 보존) — 보조 유틸 추가
+    private func _normRouteNo(_ s: String) -> String {
+        // 공백/개행 제거 + 전각숫자 → 반각 + 대문자
+        let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
+        let mapped = trimmed.applyingTransform(.fullwidthToHalfwidth, reverse: false) ?? trimmed
+        return mapped.uppercased()
     }
 
     // ADD: 누적거리 테이블에서 s 이하 마지막 인덱스
@@ -2292,13 +2429,21 @@ final class MapVM: ObservableObject {
     private func resolveRouteId(for routeNo: String) -> String? {
         if let id = routeIdByRouteNo[routeNo] { return id }
         if let id = lastKnownRouteIdByRouteNo[routeNo] { return id }
-        if let id = latestTopArrivals.first(where: { $0.routeNo == routeNo })?.routeId {
+        // 🔽 추가: 정규화 키로도 조회
+        let k = _normRouteNo(routeNo)
+        if let id = routeIdByRouteNo[k] { return id }
+        if let id = lastKnownRouteIdByRouteNo[k] { return id }
+
+        if let id = latestTopArrivals.first(where: { _normRouteNo($0.routeNo) == k })?.routeId {
             routeIdByRouteNo[routeNo] = id
+            routeIdByRouteNo[k] = id                // 정규화 키도 캐시
             lastKnownRouteIdByRouteNo[routeNo] = id
+            lastKnownRouteIdByRouteNo[k] = id
             return id
         }
         return nil
     }
+
 
     // ADD
     func onBusSelected(_ bus: BusAnnotation) async {
@@ -2872,6 +3017,7 @@ final class MapVM: ObservableObject {
 
     // MapVM
     // REPLACE: 병합/필터(스냅·ETA·미래경로 포함)
+    // MapVM 내부 교체
     private func mergeAndFilter(_ incoming: [BusLive], snap: RouteSnapshot) -> [BusLive] {
         var out: [BusLive] = []
 
@@ -2884,21 +3030,41 @@ final class MapVM: ObservableObject {
         let MAX_PLAUSIBLE_MPS: Double = 40.0
         let FOLLOW_STEP_ALLOW_METERS: CLLocationDistance = 1200
 
-        for var b in incoming {
+        for b in incoming {
             let now = Date()
             let rawC = CLLocationCoordinate2D(latitude: b.lat, longitude: b.lon)
 
-            guard let rid = resolveRouteId(for: b.routeNo) else { continue }
+            // rid가 없으면 보정 시도 없이 그대로 통과 (rid는 else 블록에서 쓸 수 없음)
+            guard let rid = resolveRouteId(for: b.routeNo) else {
+                out.append(b)
+                continue
+            }
+
+            // ── routeNo 보정: "?" 이면 캐시/최근 ETA에서 복원
+            let correctedRouteNo: String = {
+                guard b.routeNo == "?" else { return b.routeNo }
+                if let known = routeNoByRouteId[rid] {
+                    return known
+                }
+                if let known2 = latestTopArrivals.first(where: { $0.routeId == rid })?.routeNo {
+                    routeNoByRouteId[rid] = known2
+                    return known2
+                }
+                return b.routeNo
+            }()
+
             let cid = compoundBusId(routeId: rid, rawVehId: b.id)
             var bus = BusLive(
-                id: cid, routeNo: b.routeNo,
+                id: cid,
+                routeNo: correctedRouteNo,
                 lat: b.lat, lon: b.lon,
                 etaMinutes: b.etaMinutes,
                 nextStopName: b.nextStopName
             )
+
             let isFollowed = (followBusId == bus.id)
 
-            // 1) 트랙
+            // 1) 트랙 초기화
             let nowC = CLLocationCoordinate2D(latitude: bus.lat, longitude: bus.lon)
             if tracks[bus.id] == nil {
                 tracks[bus.id] = BusTrack(prevLoc: nil, prevAt: nil, lastLoc: nowC, lastAt: now)
@@ -2907,7 +3073,7 @@ final class MapVM: ObservableObject {
             }
             var tr = tracks[bus.id]!
 
-            // 2) 점프/EMA
+            // 2) 점프/EMA 스무딩
             let step = CLLocation(latitude: tr.lastLoc.latitude, longitude: tr.lastLoc.longitude)
                 .distance(from: CLLocation(latitude: nowC.latitude, longitude: nowC.longitude))
             let dt = max(0.01, now.timeIntervalSince(tr.lastAt))
@@ -2987,7 +3153,7 @@ final class MapVM: ObservableObject {
             let vForETA = max(SPEED_FLOOR_MPS, vObs)
             var sec = Int(remaining / vForETA)
             if vObs < 1.2 && remaining < NEAR_STOP_M { sec = 0 }
-            let rawETA = max(0, Int((Double(sec)/60.0).rounded(.toNearestOrEven)))
+            let rawETA = max(0, Int((Double(sec) / 60.0).rounded(.toNearestOrEven)))
             if let e = smoothETA(rawETA: rawETA, busId: bus.id, distToNextStop: remaining) {
                 bus.etaMinutes = e
                 lastETAMinByBusId[bus.id] = e
@@ -2998,18 +3164,26 @@ final class MapVM: ObservableObject {
             // 정류장 스냅
             maybeSnapToStop(&bus)
 
-            // 팔로우: 트레일/하이라이트/미래경로
+            // 팔로우 중이면 트레일 및 미래 경로
             if followBusId == bus.id {
                 let c = CLLocationCoordinate2D(latitude: bus.lat, longitude: bus.lon)
                 trail.appendIfNeeded(c); trailVersion &+= 1
                 highlightedStopId = nextStop.id
-                setFutureRouteByStops(meta: meta, from: prj, nextIdx: nextIdx, maxAheadStops: 7, includeTerminal: false)
+                setFutureRouteByStops(meta: meta, from: prj, nextIdx: nextIdx,
+                                      maxAheadStops: 7, includeTerminal: false)
             }
 
             out.append(bus)
         }
         return out
     }
+
+
+    
+    
+    
+    
+    
 
     // ADD: 컴파운드 ID
     private func compoundBusId(routeId: String, rawVehId: String) -> String {
@@ -3092,16 +3266,19 @@ final class MapVM: ObservableObject {
    
 
     // REPLACE: 도착정보 → 상위 리스트(최소 ETA/정렬/캐시 채움)
+    // 기존 시그니처/이름 유지
     private func computeTopArrivals(
         allArrivals: [ArrivalInfo],
         followedRouteNo: String?
     ) -> [ArrivalInfo] {
         var bestByRoute: [String: ArrivalInfo] = [:]
         for a in allArrivals {
+            // ✅ 0분/음수(=사실상 없음) 스킵
+            guard a.etaMinutes > 0 else { continue }
+
             routeIdByRouteNo[a.routeNo] = a.routeId
             lastKnownRouteIdByRouteNo[a.routeNo] = a.routeId
             routeNoByRouteId[a.routeId] = a.routeNo
-            if let num = numericRouteId(from: a.routeId) { numericRouteIdByRouteNo[a.routeNo] = num }
 
             if let cur = bestByRoute[a.routeId] {
                 if a.etaMinutes < cur.etaMinutes { bestByRoute[a.routeId] = a }
@@ -3121,7 +3298,7 @@ final class MapVM: ObservableObject {
         }
         return top
     }
-    
+
     
 
 
@@ -3834,11 +4011,12 @@ struct ClusteredMapView: UIViewRepresentable {
         
         
         // REPLACE: 정류장 컬러 동기화
+        // 예: recolorStops 같은 곳
         func recolorStops(_ mapView: MKMapView) {
-            for a in mapView.annotations {
-                guard let s = a as? BusStopAnnotation,
-                      let v = mapView.view(for: s) as? MKMarkerAnnotationView else { continue }
-
+            // 🔒 스냅샷으로 복사해서 순회
+            let stops = mapView.annotations.compactMap { $0 as? BusStopAnnotation }
+            for s in stops {
+                guard let v = mapView.view(for: s) as? MKMarkerAnnotationView else { continue }
                 if parent.vm.alarmedStopIds.contains(s.stop.id) {
                     v.markerTintColor = .systemYellow
                 } else if parent.vm.isStopSelected(s.stop.id) {
@@ -3848,6 +4026,7 @@ struct ClusteredMapView: UIViewRepresentable {
                 }
             }
         }
+
 
 
 
@@ -3897,7 +4076,7 @@ struct BusMapScreen: View {
     @State private var showBanner = false     // 노출 여부
     @State private var debugText = ""
         @State private var bannerMounted = false
-//        @StateObject private var banner = BannerAdController()
+        @StateObject private var banner = BannerAdController()
     
     // ✅ 알람 시트 상태
        @State private var showAlarmSheet = false
@@ -4055,37 +4234,54 @@ struct BusMapScreen: View {
             }
 
             // 상단 배너
+//            .safeAreaInset(edge: .top) {
+//                VStack(spacing: 6) {
+//                    // 1) 광고
+//                    AdFitVerboseBannerView(
+//                        clientId: "DAN-0pxnvDh8ytVm0EsZ",
+//                        adUnitSize: "320x50",
+//                        timeoutSec: 8,
+//                        maxRetries: 2
+//                    ) { event in
+//                        switch event {
+//                        case .begin(let n):  debugText = "BEGIN \(n)"
+//                        case .willLoad:      debugText = "WILL_LOAD"
+//                        case .success(let ms):
+//                            showBanner = true
+//                            debugText = "SUCCESS \(ms)ms"
+//                        case .fail(let err, let n):
+//                            showBanner = false
+//                            debugText = "FAIL(\(n)): \(err.localizedDescription)"
+//                        case .timeout(let sec, let n):
+//                            showBanner = false
+//                            debugText = "TIMEOUT \(sec)s (attempt \(n))"
+//                        case .retryScheduled(let after, let next):
+//                            debugText = "RETRY in \(after)s → \(next)"
+//                        case .disposed:
+//                            debugText = "disposed"
+//                        }
+//                    }
+//                    .frame(width: 320, height: 50)
+//                    .opacity(showBanner ? 1 : 0)
+//                    .allowsHitTesting(showBanner)
+//
+//                    // 공지 바 (광고 바로 아래)
+//                            NoticeBarView()
+//                                .fixedSize(horizontal: false, vertical: true)   // 줄바꿈 시 높이만 늘어나게
+//                                .padding(.horizontal, 8)
+//                }
+//                .padding(.vertical, 8)                 // 위아래 살짝 여백
+//                .frame(maxWidth: .infinity, alignment: .top)
+//                .animation(.easeInOut(duration: 0.2), value: showBanner)
+//            }
             .safeAreaInset(edge: .top) {
                 VStack(spacing: 6) {
-                    // 1) 광고
-                    AdFitVerboseBannerView(
-                        clientId: "DAN-0pxnvDh8ytVm0EsZ",
-                        adUnitSize: "320x50",
-                        timeoutSec: 8,
-                        maxRetries: 2
-                    ) { event in
-                        switch event {
-                        case .begin(let n):  debugText = "BEGIN \(n)"
-                        case .willLoad:      debugText = "WILL_LOAD"
-                        case .success(let ms):
-                            showBanner = true
-                            debugText = "SUCCESS \(ms)ms"
-                        case .fail(let err, let n):
-                            showBanner = false
-                            debugText = "FAIL(\(n)): \(err.localizedDescription)"
-                        case .timeout(let sec, let n):
-                            showBanner = false
-                            debugText = "TIMEOUT \(sec)s (attempt \(n))"
-                        case .retryScheduled(let after, let next):
-                            debugText = "RETRY in \(after)s → \(next)"
-                        case .disposed:
-                            debugText = "disposed"
-                        }
-                    }
-                    .frame(width: 320, height: 50)
-                    .opacity(showBanner ? 1 : 0)
-                    .allowsHitTesting(showBanner)
-
+                   
+                    BannerAdView(controller: banner)
+                        .frame(height: 50)              // 일반 배너 높이
+                        .frame(maxWidth: .infinity)
+                        .background(.ultraThinMaterial) // 구분감
+                        .shadow(radius: 1)
                     // 공지 바 (광고 바로 아래)
                             NoticeBarView()
                                 .fixedSize(horizontal: false, vertical: true)   // 줄바꿈 시 높이만 늘어나게
@@ -4095,7 +4291,6 @@ struct BusMapScreen: View {
                 .frame(maxWidth: .infinity, alignment: .top)
                 .animation(.easeInOut(duration: 0.2), value: showBanner)
             }
-
             // 알람 설정 시트
             .sheet(isPresented: $showAlarmSheet) {
                 VStack(alignment: .leading, spacing: 16) {
@@ -4567,50 +4762,73 @@ final class LocalAlertCenter: NSObject, UNUserNotificationCenterDelegate {
 }
 
 
+// REPLACE: StopETAInfoPanel 전체 교체
 struct StopETAInfoPanel: View {
     @ObservedObject var vm: MapVM
     var onTapAlarm: () -> Void
-    
+
+    // 스크롤 높이 한도 (화면 높이의 35% 또는 220 중 큰 값으로)
+    private var maxListHeight: CGFloat {
+        max(UIScreen.main.bounds.height * 0.35, 220)
+    }
+
     var body: some View {
         if let s = vm.focusStop {
-            VStack(alignment: .leading, spacing: 8) {
+            VStack(alignment: .leading, spacing: 10) {
+                // ── 헤더(고정) ─────────────────────────────────────────────
                 HStack {
                     Text("🚏 \(s.name)")
                         .font(.headline)
                         .lineLimit(1)
                         .truncationMode(.tail)
                     Spacer()
-                    Button { withAnimation { vm.setFocusStop(nil) } } label: {
+                    Button {
+                        withAnimation { vm.setFocusStop(nil) }
+                    } label: {
                         Image(systemName: "xmark")
                     }
+                    .buttonStyle(.plain)
                 }
-                
-                if vm.focusStopLoading {
-                    HStack(spacing: 6) {
-                        ProgressView()
-                        Text("ETA 불러오는 중…").font(.caption)
+
+                // ── 본문(스크롤 영역) ──────────────────────────────────────
+                Group {
+                    if vm.focusStopLoading {
+                        HStack(spacing: 6) {
+                            ProgressView()
+                            Text("ETA 불러오는 중…").font(.caption)
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    } else if vm.focusStopETAs.isEmpty {
+                        Text("도착 정보 없음")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    } else {
+                        ScrollView(.vertical, showsIndicators: true) {
+                            etaList()      // 리스트 자체는 그대로 사용
+                                .padding(.vertical, 2)
+                        }
+                        .frame(maxHeight: maxListHeight)   // ⬅️ 스크롤 높이 제한
                     }
-                } else if vm.focusStopETAs.isEmpty {
-                    Text("도착 정보 없음")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                } else {
-                    etaList()   // ✅ 여기
                 }
-                
+
+                // ── 푸터 버튼(고정) ────────────────────────────────────────
                 HStack {
                     Button {
                         Task { await vm.refreshFocusStopETA() }
-                    } label: { Label("새로고침", systemImage: "arrow.clockwise") }
-                    
+                    } label: {
+                        Label("새로고침", systemImage: "arrow.clockwise")
+                    }
+
                     Spacer()
-                    
+
                     Button { onTapAlarm() } label: {
                         Label("알람", systemImage: "bell.badge.fill")
                     }
                     .buttonStyle(.borderedProminent)
                 }
                 .font(.caption)
+                .padding(.top, 2)
             }
             .padding(10)
             .frame(maxWidth: 280)
@@ -4618,9 +4836,7 @@ struct StopETAInfoPanel: View {
             .shadow(radius: 2)
             .transition(.move(edge: .leading).combined(with: .opacity))
         }
-        
     }
-    
     
     // ✅ 에러 없이 컴파일 잘 되는 리스트 렌더링
     @ViewBuilder

@@ -1,0 +1,6 @@
+framework module Pods_seoulbusyo {
+  umbrella header "Pods-seoulbusyo-umbrella.h"
+
+  export *
+  module * { export * }
+}
